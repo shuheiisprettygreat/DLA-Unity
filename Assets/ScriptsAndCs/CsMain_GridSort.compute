@@ -1,0 +1,266 @@
+#include "DirectedPoint.cginc"
+
+#define BLOCK_SIZE 256
+
+RWStructuredBuffer<DirectedPoint> ParticlesWrite;
+StructuredBuffer<DirectedPoint> ParticlesRead;
+
+float2 Seed;
+float BoundRadius;
+float3 BoundOrigin;
+int NrParticle;
+float StickDistanceSq;
+float StickAngle;
+
+float random (float2 st) {
+    return frac(sin(dot(st.xy, Seed))*43758.5453123);
+}
+
+float mag2(float3 v)
+{
+    return dot(v,v);
+}
+
+//----------------------------------
+// Random Walk
+//----------------------------------
+#pragma kernel RW
+
+[numthreads(BLOCK_SIZE,1,1)]
+void RW (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    ParticlesWrite[i] = ParticlesRead[i];
+    if(ParticlesRead[i].isActive == 1)
+    {
+        float3 pos = ParticlesRead[i].position;
+        float3 d;
+        d.x = random(pos.yz/100.0f);
+        d.y = random(pos.zx/100.0f);
+        d.z = random(pos.xy/100.0f);
+        d = d*2 - 1;
+        
+        pos += d;
+    
+        ParticlesWrite[i].position = pos;
+        ParticlesWrite[i].life = ParticlesRead[i].life + 1;
+
+        if(mag2(pos - BoundOrigin) > BoundRadius * BoundRadius)
+        {
+            ParticlesWrite[i].position = pos-d;
+        }
+    }
+}
+
+//----------------------------------
+// Hash related shits
+//----------------------------------
+
+// Structs ------------------------
+struct HashedParticle
+{
+    int iParticle;
+    int hash;
+};
+
+struct GridIndex
+{
+    int start;
+    int end;
+};
+
+
+// Kernels ------------------------
+#pragma kernel CalcParticleHash
+#pragma kernel BitonicSort
+#pragma kernel ClearGridIndices
+#pragma kernel BuildGridIndices
+
+StructuredBuffer<HashedParticle> HashedParticlesRead;
+RWStructuredBuffer<HashedParticle> HashedParticlesWrite;
+RWStructuredBuffer<GridIndex> GridIndices;
+
+float3 GridOrigin;
+float GridSize;
+int NrGridOnEdge;
+int SizeOfHash;
+
+int Stage;
+int Step;
+int Offset;
+int OffsetExp;
+
+// Spatial hash
+#define P1 269923
+#define P2 959779
+#define P3 261601
+
+int3 Position2Grid(float3 pos)
+{
+    return floor((pos - GridOrigin) / GridSize);;
+}
+
+int Grid2Hash(uint3 grid)
+{
+    return (grid.x*P1 ^ grid.y*P2 ^ grid.z*P2) % SizeOfHash;
+}
+
+int Position2Hash(float3 pos)
+{
+    return Grid2Hash(Position2Grid(pos));
+}
+
+[numthreads(BLOCK_SIZE, 1, 1)]
+void CalcParticleHash(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    DirectedPoint p = ParticlesRead[i];
+    HashedParticle hp = {i, Position2Hash(p.position)};
+    if(p.isActive == 1) hp.hash = 0x7fffffff;
+    HashedParticlesWrite[i] = hp;
+}
+  
+bool compare(int hash1, int hash2)
+{
+    return hash1 <= hash2;
+}
+
+[numthreads(BLOCK_SIZE, 1, 1)]
+void BitonicSort(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    bool b1 = (i >> Stage & 1) == 0;
+    bool b2 = (i%(Offset<<1)) >> OffsetExp == 0;
+
+    HashedParticle pi = HashedParticlesRead[i];
+    HashedParticle pj = HashedParticlesRead[b2 ? i+Offset : i-Offset];
+    
+    bool isInOrder = compare(pi.hash, pj.hash);
+    bool isInReversedOrder = compare(pj.hash, pi.hash);
+
+    if(isInOrder && isInReversedOrder)
+    {
+        HashedParticlesWrite[i] = pj;
+        return;
+    }
+    
+    isInOrder = b1==b2 ? isInOrder : !isInOrder;
+
+    if(isInOrder)
+    {
+        HashedParticlesWrite[i] = pi;
+    }
+    else
+    {
+        HashedParticlesWrite[i] = pj;
+    }
+    
+}
+
+[numthreads(BLOCK_SIZE, 1, 1)]
+void ClearGridIndices(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    GridIndex gi = {0x7fffffff, 0x7fffffff}; // 0x7fffffff : int max
+    GridIndices[i] = gi;
+}
+
+[numthreads(BLOCK_SIZE, 1, 1)]
+void BuildGridIndices(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    int iPrev = i==0 ? NrParticle-1 : i-1;
+    int iNext = i==NrParticle-1 ? 0 : i+1;
+
+    int hash = HashedParticlesRead[i].hash;
+    int hashPrev = HashedParticlesRead[iPrev].hash;
+    int hashNext = HashedParticlesRead[iNext].hash;
+    
+    if(hash != hashPrev) GridIndices[hash].start = i;
+
+    if(hash != hashNext) GridIndices[hash].end = i+1;
+}
+
+//----------------------------------
+// Fix moving particle if bump into other fixed ones.
+// Guaranteed that all fixed particles are partitioned to front
+//----------------------------------
+#pragma kernel FixIfBump
+
+// DirectedPoint FixIfBump(DirectedPoint p)
+// {
+//     if(p.isActive == 0) return p;
+//     
+//     for(int i=0; i<NrParticle; i++){
+//         DirectedPoint q = ParticlesRead[i];
+//         if(q.isActive == 1) return p;
+//
+//         float3 diff = p.position - q.position;
+//         if(mag2(diff) < StickDistanceSq)
+//         {
+//             float3 nd = normalize(diff);
+//             if(dot(nd, q.tangent) > StickAngle)
+//             {
+//                 p.tangent = normalize(q.tangent + q.acceleration*0.00005);
+//                 p.acceleration = q.acceleration;
+//                 p.isActive = 0;
+//                 return p;
+//             }
+//         }
+//     }
+//     
+//     return p;
+// }
+
+[numthreads(BLOCK_SIZE,1,1)]
+void FixIfBump(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    DirectedPoint pi = ParticlesRead[i];
+    if(pi.isActive == 0) return;
+    int3 grid = Position2Grid(pi.position);
+    // Search for fixed particle from adjacent grids.
+    [unroll]
+    for(int dx=-1; dx<=1; dx++)
+    {
+        [unroll]
+        for(int dy=-1; dy<=1; dy++)
+        {
+            [unroll]
+            for(int dz=-1; dz<=1; dz++)
+            {
+                int3 neighborGrid = grid + int3(dx, dy, dz);
+                neighborGrid = clamp(neighborGrid, int3(0, 0, 0), NrGridOnEdge.xxx);
+                GridIndex gi = GridIndices[Grid2Hash(neighborGrid)];
+                for(int j=gi.start; j < gi.end; j++)
+                {
+                    DirectedPoint pj = ParticlesRead[HashedParticlesRead[j].iParticle];
+                    float3 diff = pi.position - pj.position;
+                    if(pj.isActive == 0 && (mag2(diff)) < StickDistanceSq)
+                    {
+                        float3 nd = normalize(diff);
+                        if(dot(nd, pj.tangent) > StickAngle)
+                        {
+                            pi.tangent = normalize(lerp(pj.tangent,nd,0.01) + pj.acceleration*0.00005);
+                            pi.acceleration = pj.acceleration;
+                            pi.position = pj.position + 2*nd;
+                            pi.isActive = 0;
+                            ParticlesWrite[i] = pi;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ParticlesWrite[i] = pi;
+}
+
+
+
+
+
+
+
+
+

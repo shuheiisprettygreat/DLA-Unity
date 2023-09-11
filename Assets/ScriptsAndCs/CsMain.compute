@@ -1,0 +1,100 @@
+#pragma kernel RW
+#pragma kernel FixIfBump
+
+#define BLOCK_SIZE 256
+
+struct DirectedPoint {
+    float3 position;
+    float3 tangent;
+    int isActive;
+};
+
+RWStructuredBuffer<DirectedPoint> Particles;
+StructuredBuffer<DirectedPoint> ParticlesRead;
+
+float2 Seed;
+float BoundRadius;
+int NrParticle;
+
+float random (float2 st) {
+    return frac(sin(dot(st.xy, Seed))*43758.5453123);
+}
+
+float mag2(float3 v)
+{
+    return dot(v, v);
+}
+
+
+// ----------------------------------
+[numthreads(BLOCK_SIZE,1,1)]
+void RW (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if(Particles[i].isActive == 1)
+    {
+        float3 pos = Particles[i].position;
+        float3 d;
+        d.x = random(pos.yz/100.0f);
+        d.y = random(pos.zx/100.0f);
+        d.z = random(pos.xy/100.0f);
+        d = d*2 - 1;
+        
+        pos += d;
+    
+        Particles[i].position = pos;
+
+        if(mag2(pos) > BoundRadius * BoundRadius)
+        {
+            Particles[i].position = pos-d;
+            //Particles[i].position = d * BoundRadius*0.707; // 1/sqrt(2)
+        }
+    }
+}
+
+
+// ----------------------------------
+
+groupshared DirectedPoint sharedParticle[BLOCK_SIZE];
+
+DirectedPoint FixIfBumpIntoFixed(DirectedPoint p, uint gi)
+{
+    for(int block_id = 0; block_id < NrParticle; block_id += BLOCK_SIZE)
+    {
+        sharedParticle[gi] = ParticlesRead[block_id + gi];
+        GroupMemoryBarrierWithGroupSync();
+
+        for(int i=0; i<BLOCK_SIZE; i++)
+        {
+            if(block_id + i >= NrParticle) break;
+            DirectedPoint q = sharedParticle[i];
+
+            float3 d = p.position - q.position;
+            if(p.isActive==1 && q.isActive == 0 && mag2(p.position - q.position) < 0.8)
+            {
+                float3 nd = normalize(d);
+                if(dot(nd, q.tangent) > 0.3)
+                {
+                    p.tangent = nd;
+                    p.isActive = 0;
+                }
+            }
+        }
+        
+        GroupMemoryBarrierWithGroupSync();
+
+    }
+
+    return p;
+}
+
+[numthreads(BLOCK_SIZE,1,1)]
+void FixIfBump(uint3 id : SV_DispatchThreadID, uint gi: SV_GroupIndex)
+{
+    
+    int i = id.x;
+    DirectedPoint p = ParticlesRead[i];
+    p = FixIfBumpIntoFixed(p, gi);
+
+    Particles[i] = p;
+}

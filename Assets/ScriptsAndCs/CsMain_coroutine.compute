@@ -1,0 +1,159 @@
+#pragma kernel RW
+#pragma kernel FixIfBump
+
+#define BLOCK_SIZE 256
+
+#include "DirectedPoint.cginc"
+
+RWStructuredBuffer<DirectedPoint> ParticlesWrite;
+StructuredBuffer<DirectedPoint> ParticlesRead;
+
+float2 Seed;
+float BoundRadius;
+int NrParticle;
+float StickDistanceSq;
+float StickAngle;
+
+//-------------------------
+int MaxParticlePerDispatch;
+int IndexOffset;
+//-------------------------
+
+float random (float2 st) {
+    return frac(sin(dot(st.xy, Seed))*43758.5453123);
+}
+
+float mag2(float3 v)
+{
+    return dot(v,v);
+}
+
+//----------------------------------
+// Random Walk
+//----------------------------------
+[numthreads(BLOCK_SIZE,1,1)]
+void RW (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if(i > MaxParticlePerDispatch) return;
+
+    i += IndexOffset;
+        
+    ParticlesWrite[i] = ParticlesRead[i];
+    if(ParticlesRead[i].isActive == 1)
+    {
+        float3 pos = ParticlesRead[i].position;
+        float3 d;
+        d.x = random(pos.yz/100.0f);
+        d.y = random(pos.zx/100.0f);
+        d.z = random(pos.xy/100.0f);
+        d = d*2 - 1;
+        
+        pos += d;
+    
+        ParticlesWrite[i].position = pos;
+        ParticlesWrite[i].life = ParticlesRead[i].life + 1;
+
+        if(mag2(pos) > BoundRadius * BoundRadius)
+        {
+            ParticlesWrite[i].position = pos-d;
+        }
+    }
+}
+
+
+//----------------------------------
+// Sort related kernels.
+//----------------------------------
+#pragma kernel StartScan
+#pragma kernel Scan
+#pragma kernel Pack
+
+StructuredBuffer<int> CountFixedRead;
+RWStructuredBuffer<int> CountFixedWrite;
+StructuredBuffer<int> CountMovingRead;
+RWStructuredBuffer<int> CountMovingWrite;
+
+int isFixed(DirectedPoint p) { return p.isActive == 0 ? 1 : 0; }
+
+[numthreads(BLOCK_SIZE, 1, 1)]
+void StartScan(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    int f = isFixed(ParticlesRead[i]);
+    CountFixedWrite[i] = f;
+    CountMovingWrite[i] = 1-f;
+}
+
+int ShiftAmount;
+[numthreads(BLOCK_SIZE, 1, 1)]
+void Scan(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    if(i>=NrParticle) return;
+    int di = ShiftAmount;
+    CountFixedWrite[i] = i>=di ? CountFixedRead[i] + CountFixedRead[i-di] : CountFixedRead[i];
+    CountMovingWrite[i] = i>=di ? CountMovingRead[i] + CountMovingRead[i-di] : CountMovingRead[i];
+}
+
+[numthreads(BLOCK_SIZE, 1, 1)]
+void Pack(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if(i > MaxParticlePerDispatch) return;
+
+    i += IndexOffset;
+    
+    if(i>=NrParticle) return;
+    DirectedPoint pRead = ParticlesRead[i];
+    if(isFixed(pRead))
+    { 
+        ParticlesWrite[CountFixedRead[i]-1] = pRead;
+    }else
+    {
+        ParticlesWrite[NrParticle - CountMovingRead[i]] = pRead;
+    }
+}
+
+
+//----------------------------------
+// Fix moving particle if bump into other fixed ones.
+// Guaranteed that all fixed particles are partitioned to front
+//----------------------------------
+
+DirectedPoint FixIfBump(DirectedPoint p)
+{
+    if(p.isActive == 0) return p;
+    
+    for(int i=0; i<NrParticle; i++){
+        DirectedPoint q = ParticlesRead[i];
+        if(q.isActive == 1) return p;
+
+        float3 diff = p.position - q.position;
+        if(mag2(diff) < StickDistanceSq)
+        {
+            float3 nd = normalize(diff);
+            if(dot(nd, q.tangent) > StickAngle)
+            {
+                p.tangent = normalize(q.tangent + q.acceleration*0.00005);
+                p.acceleration = q.acceleration;
+                p.isActive = 0;
+                return p;
+            }
+        }
+    }
+    
+    return p;
+}
+
+[numthreads(BLOCK_SIZE,1,1)]
+void FixIfBump(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if(i > MaxParticlePerDispatch) return;
+
+    i += IndexOffset;
+    
+    DirectedPoint p = ParticlesRead[i];
+    ParticlesWrite[i] = FixIfBump(p);
+}
