@@ -120,9 +120,9 @@ void CalcParticleHash(uint3 id : SV_DispatchThreadID)
     HashedParticlesWrite[i] = hp;
 }
   
-bool compare(int hash1, int hash2)
+bool compare(HashedParticle p, HashedParticle q)
 {
-    return hash1 <= hash2;
+    return (p.hash==q.hash) ? p.iParticle <= q.iParticle : p.hash <= q.hash;
 }
 
 [numthreads(BLOCK_SIZE, 1, 1)]
@@ -135,15 +135,7 @@ void BitonicSort(uint3 id : SV_DispatchThreadID)
     HashedParticle pi = HashedParticlesRead[i];
     HashedParticle pj = HashedParticlesRead[b2 ? i+Offset : i-Offset];
     
-    bool isInOrder = compare(pi.hash, pj.hash);
-    bool isInReversedOrder = compare(pj.hash, pi.hash);
-
-    if(isInOrder && isInReversedOrder)
-    {
-        HashedParticlesWrite[i] = pj;
-        return;
-    }
-    
+    bool isInOrder = compare(pi, pj);
     isInOrder = b1==b2 ? isInOrder : !isInOrder;
 
     if(isInOrder)
